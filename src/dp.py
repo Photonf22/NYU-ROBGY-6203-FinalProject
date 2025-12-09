@@ -15,7 +15,10 @@ from natsort import natsorted
 import logging
 import matplotlib.pyplot as plt
 from collections import deque
-
+from collections import OrderedDict
+import torch.nn.functional as F
+import time
+device = torch.device("cuda")
 
 # image preprocessing/ transforms
 preprocess = transforms.Compose(
@@ -34,21 +37,25 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 class Autonnomous_resnet_Navigator(Player):
     # Configuration
-    def __init__(self):
-        self.save_dir = "data/final_data/images_subsample"
+    def __init__(self, device="cuda"):
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+        self.save_dir = "data/images_subsample"
         if not os.path.exists(self.save_dir):
             raise FileNotFoundError(f"Directory {self.save_dir} does not exist")
         if os.path.exists("codebook.pkl"):
             with open("codebook.pkl", "rb") as f:
                 self.codebook = pickle.load(f)
-        self.DATA_ROOT = "./data/final_data/"
+        self.DATA_ROOT = "./data/"
         #QUERY_DIR = os.path.join(DATA_ROOT, "query")
         self.DB_DIR = os.path.join(self.DATA_ROOT, "images_subsample")
         self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.backbone = None
-        self.yolo_descriptors = None
+        self.fpv_fmap = None
+        self.resnet_descriptors = None
         self.codebook = None
         self.database = None
+        self.turn_action =  Action.RIGHT # default turn action
         self.exploration_images = []
         self.stuck_cooldown = 0          # steps until we allow another stuck trigger
         self.best_dist_to_goal = None    # best (smallest) distance so far
@@ -58,20 +65,133 @@ class Autonnomous_resnet_Navigator(Player):
         self.goal_id = None
         self.current_id = None
         self.num_images = 0
-        self.lazy_indexing = True
+        self.nav_start_time = None
+        self.time_budget = 60.0
+        self.lazy_indexing = False
         self.position_history = deque(maxlen=20)
         self.action_history = deque(maxlen=5)
         self.consecutive_forward = 0
         self.recovery_queue = deque()
-
-
+        self.vlad_cache_dir = os.path.join(os.getcwd(), "vlad_cache")
+        os.makedirs(self.vlad_cache_dir, exist_ok=True)
+        self._state = None
         self.show_visualization = True
         self.visualization_window = None
         self.target_comparison_window = None
+
+        # Keep everything up to layer4 (excluding avgpool + fc)
+        # children() = [conv1, bn1, relu, maxpool, layer1, layer2, layer3, layer4, avgpool, fc]
+        
+        self.backbone_spatial = nn.Sequential(*list(resnet.children())[:-2]).to(self.DEVICE)
+        self.backbone_spatial.to(self.device).eval()
+        self.preprocess = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        self.preprocess_no_resize = transforms.Compose([
+            transforms.ToTensor(),   # -> [3,H,W] float32 in [0,1]
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
         super(Autonnomous_resnet_Navigator, self).__init__()
 
-        if os.path.exists("yoloo_descriptors.npy"):
-            self.yolo_descriptors = np.load("yolo_descriptors.npy")
+        if os.path.exists("resnet_descriptors.npy"):
+            self.sift_descriptors = np.load("resnet_descriptors.npy")
+        if os.path.exists("codebook.pkl"):
+            with open("codebook.pkl", "rb") as f:
+                self.codebook = pickle.load(f)
+
+        logging.info("initialized")
+    def prepare_for_resnet(self,img_bgr):
+        # img_bgr: numpy [240,320,3] uint8 from cv2
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(img_rgb)
+
+        x = self.preprocess_no_resize(pil).unsqueeze(0)   # [1,3,240,320]
+        return x
+
+    def get_vlad(self, img):
+        """
+        Compute VLAD (Vector of Locally Aggregated Descriptors) descriptor for a given image
+        """
+        # We use a SIFT in combination with VLAD as a feature extractor as it offers several benefits
+        # 1. SIFT features are invariant to scale and rotation changes in the image
+        # 2. SIFT features are designed to capture local patterns which makes them more robust against noise
+        # 3. VLAD aggregates local SIFT descriptors into a single compact representation for each image
+        # 4. VLAD descriptors typically require less memory storage compared to storing the original set of SIFT
+        # descriptors for each image. It is more practical for storing and retrieving large image databases efficicently.
+
+        # Pass the image to sift detector and get keypoints + descriptions
+        # Again we only need the descriptors
+        #_, des = self.sift.detectAndCompute(img, None)
+        #img = self.prepare_for_resnet(img).to(device)
+        des = self.compute_descriptor(self.backbone, img)  # likely a torch.Tensor
+
+        # Ensure: 2D, N x 512
+        if isinstance(des, torch.Tensor):
+            if des.ndim == 1:         # [512] -> [1,512]
+                des = des.unsqueeze(0)
+            des_np = des.detach().cpu().numpy().astype(np.float32, copy=False)
+        else:
+            des_np = np.asarray(des, dtype=np.float32)
+            if des_np.ndim == 1:      # (512,) -> (1,512)
+                des_np = des_np.reshape(1, -1)
+        des = des_np
+        #print("des_np shape for KMeans:", des.shape)  # should be (N, 512)
+        # We then predict the cluster labels using the pre-trained codebook
+        # Each descriptor is assigned to a cluster, and the predicted cluster label is returned
+        pred_labels = self.codebook.predict(des)
+        # Get number of clusters that each descriptor belongs to
+        centroids = self.codebook.cluster_centers_
+        # Get the number of clusters from the codebook
+        k = self.codebook.n_clusters
+        VLAD_feature = np.zeros([k, des.shape[1]])
+
+        # Loop over the clusters
+        for i in range(k):
+            # If the current cluster label matches the predicted one
+            if np.sum(pred_labels == i) > 0:
+                # Then, sum the residual vectors (difference between descriptors and cluster centroids)
+                # for all the descriptors assigned to that clusters
+                # axis=0 indicates summing along the rows (each row represents a descriptor)
+                # This way we compute the VLAD vector for the current cluster i
+                # This operation captures not only the presence of features but also their spatial distribution within the image
+                VLAD_feature[i] = np.sum(des[pred_labels==i, :] - centroids[i], axis=0)
+        VLAD_feature = VLAD_feature.flatten()
+        # Apply power normalization to the VLAD feature vector
+        # It takes the element-wise square root of the absolute values of the VLAD feature vector and then multiplies 
+        # it by the element-wise sign of the VLAD feature vector
+        # This makes the resulting descriptor robust to noice and variations in illumination which helps improve the 
+        # robustness of VPR systems
+        VLAD_feature = np.sign(VLAD_feature)*np.sqrt(np.abs(VLAD_feature))
+        # Finally, the VLAD feature vector is normalized by dividing it by its L2 norm, ensuring that it has unit length
+        VLAD_feature = VLAD_feature/np.linalg.norm(VLAD_feature)
+
+        return VLAD_feature
+    def _extract_feature_map(self, bgr_img: np.ndarray) -> torch.Tensor:
+        """
+        bgr_img: OpenCV BGR uint8 image, shape [H, W, 3]
+        returns: feature map [C, Hf, Wf] on self.device
+        """
+        rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb)
+
+        x = self.preprocess(pil_img).unsqueeze(0).to(self.device)  # [1,3,224,224]
+        with torch.no_grad():
+            fmap = self.backbone_spatial(x)   # [1, C, Hf, Wf]
+        return fmap[0]                        # [C, Hf, Wf]
+    
+    def codebook_init(self):
+        if os.path.exists("resnet_descriptors.npy"):
+            self.resnet_descriptors = np.load("resnet_descriptors.npy")
         if os.path.exists("codebook.pkl"):
             with open("codebook.pkl", "rb") as f:
                 self.codebook = pickle.load(f)
@@ -84,11 +204,39 @@ class Autonnomous_resnet_Navigator(Player):
         backbone.to(self.DEVICE)
         return backbone
 
+    def compute_features(self):
+        files = natsorted([x for x in os.listdir(self.save_dir) if x.endswith('.jpg')])
+        self.num_images = len(files)
+        self.resnet_descriptors = []
+
+        logging.info(f"Computing ResNet features for {self.num_images} images...")
+        for img_file in tqdm(files, desc="Extracting ResNet descriptors"):
+            img = cv2.imread(os.path.join(self.save_dir, img_file))
+            self.exploration_images.append(img)
+            des = self.compute_descriptor(self.backbone, img)   # expect (512,) or (1,512)
+            if des is not None:
+                des = np.asarray(des).reshape(1, -1)            # (1,512)
+                self.resnet_descriptors.append(des)             # append as row
+
+        # stack into [num_images, 512]
+        features = np.vstack(self.resnet_descriptors)           # (N,512)
+        return features
+
+    
     @torch.no_grad()
     def compute_descriptor(self, backbone, img_):
-        #img = Image.open(img_path).convert("RGB")
-        #img = cv2.cvtColor(img_, cv2.COLOR_BGR2RGB)
-        x = preprocess(img_).unsqueeze(0).to(self.DEVICE)  
+        to_tensor_transform = transforms.ToTensor()
+        if(isinstance(img_,torch.Tensor) == False):
+            if(isinstance(img_, np.ndarray) == True):
+                pil_image = Image.fromarray(img_)
+                img_ = preprocess(pil_image)
+                x = img_.to(self.DEVICE)
+            else:
+                img_ = preprocess(img_)
+                x = img_.to(self.DEVICE)
+        else:
+            img_ = preprocess(img_).to(self.DEVICE)
+        x = x.unsqueeze(0)
         feat = backbone(x)                           
         feat = feat.view(1, -1)                      
         # L2 normalize
@@ -105,15 +253,17 @@ class Autonnomous_resnet_Navigator(Player):
             desc = self.compute_descriptor(backbone, img)
             db_index.append((fname, desc))
         return db_index
-
     def is_stuck(self, dist_to_goal):
-        if len(self.position_history) < 15:
+        # Need some history, but not too much
+        if len(self.position_history) < 10:
             return False
 
+        # Simple cooldown so we don't trigger every frame
         if self.stuck_cooldown > 0:
             return False
 
-        recent = list(self.position_history)[-15:]
+        # Look at the last 10 positions
+        recent = list(self.position_history)[-10:]
         unique = len(set(recent))
 
         from collections import Counter
@@ -121,17 +271,24 @@ class Autonnomous_resnet_Navigator(Player):
         most_common_id, most_common_count = counts.most_common(1)[0]
         freq = most_common_count / len(recent)
 
-        stuck_pos = (unique <= 4 and freq > 0.7)
+        # More aggressive stuck criteria:
+        # - we're bouncing among very few indices
+        # - one index dominates the window
+        stuck_pos = (unique <= 3 and freq > 0.6)
 
+        # Progress logic: track best distance to goal so far
         if self.best_dist_to_goal is None or dist_to_goal < self.best_dist_to_goal - 2:
             self.best_dist_to_goal = dist_to_goal
             self.no_progress_steps = 0
         else:
             self.no_progress_steps += 1
 
-        stuck_progress = self.no_progress_steps > 40
+        # Fewer steps allowed without improving
+        stuck_progress = self.no_progress_steps > 20
 
         return stuck_pos and stuck_progress
+
+    
     def show_target_comparison(self, targets, matched_images, goal_info):
         """Display target images vs matched database images"""
         view_names = ['Front', 'Right', 'Back', 'Left']
@@ -162,27 +319,16 @@ class Autonnomous_resnet_Navigator(Player):
         if targets is None or len(targets) == 0:
             logging.error("No target images available")
             return None
-        
+
         goal_candidates = []
         matched_images = []
         for i, target in enumerate(targets):
-        #    indices, distances = self.get_neighbor(target, k=1)
-        #    goal_candidates.append((indices[0], distances[0]))
-        #    matched_images.append(self.exploration_images[indices[0]])
-        #    logging.info(f"Target view {i}: ID {indices[0]} (dist: {distances[0]:.4f})")
-            matches = self.retrieve_matches(self.backbone, self.db_index, targets, top_k=1)
-            for i, (score, distance, fname) in enumerate(matches, start=1):
-                m_img = Image.open(os.path.join(self.DB_DIR, fname)).convert("RGB")
-                matched_images.append(m_img)
-            goal_candidates.append((matches[0], matches[1]))
-        #for rank, (score, fname) in enumerate(matches, start=1):
-        #    print(f"#{rank}: {fname} (similarity = {score:.4f})")
-        #good_matches = []
-        #for i, (score, distance, fname) in enumerate(matches, start=1):
-            #m_img = Image.open(os.path.join(self.DB_DIR, fname)).convert("RGB")
-            
-        #    good_matches.append(m_img)
-        goal_id = matches[0]
+            indices, distances = self.get_neighbor(target, k=1)
+            goal_candidates.append((indices[0], distances[0]))
+            matched_images.append(self.exploration_images[indices[0]])
+            logging.info(f"Target view {i}: ID {indices[0]} (dist: {distances[0]:.4f})")
+
+        goal_id = goal_candidates[0][0]
         logging.info(f"Primary goal: Image {goal_id}")
         if self.show_visualization:
             self.show_target_comparison(targets, matched_images, goal_candidates)
@@ -191,12 +337,14 @@ class Autonnomous_resnet_Navigator(Player):
     def retrieve_matches(self, backbone, db_index, img, top_k=10):
         #for i, fname in enumerate(img_path):
         #    path = os.path.join(self.DB_DIR, fname)
+        #print(type(img))
+
         q_desc = self.compute_descriptor(backbone, img)
      
         sims = []
         for fname, d_desc in db_index:
             s = float(np.dot(q_desc, d_desc)) 
-            dist =  np.linalg.norm(q_desc, d_desc)
+            dist =  np.linalg.norm(q_desc - d_desc)
             sims.append((s, dist, fname))
 
         sims.sort(reverse=True, key=lambda x: x[0]) 
@@ -214,57 +362,126 @@ class Autonnomous_resnet_Navigator(Player):
         self.best_dist_to_goal = None
         self.no_progress_steps = 0
 
-    def compute_turn_direction(self, current_img):
-        #kp1, des1 = self.sift.detectAndCompute(current_img, None)
-        #kp2, des2 = self.sift.detectAndCompute(target_img, None)
+    def compute_turn_direction(self, current_img, target_img,
+                               #fmap1=None,
+                               ratio_thresh=0.75,
+                               min_matches=10,
+                               pixel_threshold=10.0):
+        """
+        current_img, target_img: OpenCV BGR uint8 images.
+        Returns:
+            1  = turn one way (e.g. "right")
+           -1  = turn the other way (e.g. "left")
+            0  = no clear turn
+        """
+        #if fmap1 is None:
+        #    fmap1 = self._extract_feature_map(current_img)
+        # 1) Feature maps
+        fmap1 = self._extract_feature_map(current_img)  # [C, Hf, Wf]
+        fmap2 = self._extract_feature_map(target_img)   # [C, Hf, Wf]
 
-        #if des1 is None or des2 is None or len(des1) < 10 or len(des2) < 10:
-        #    return 0
+        C, Hf, Wf = fmap1.shape
 
+        # 2) Flatten to [N, C] and L2-normalize along C
+        # N = Hf * Wf
+        f1 = fmap1.view(C, -1).T    # [N, C]
+        f2 = fmap2.view(C, -1).T    # [N, C]
 
-        #bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
-        #matches = bf.knnMatch(des1, des2, k=2)
+        f1 = F.normalize(f1, p=2, dim=1)
+        f2 = F.normalize(f2, p=2, dim=1)
 
-        matches = self.retrieve_matches(self.backbone, self.db_index, current_img, top_k=20)
+        # 3) Similarity matrix: [N1, N2] = [N, N]
+        # sim[i, j] = cosine similarity between feature i in img1 and feature j in img2
+        # (matrix multiply because both are normalized)
+        sim = torch.matmul(f1, f2.T)  # [N, N]
 
-        #for rank, (score, fname) in enumerate(matches, start=1):
-        #    print(f"#{rank}: {fname} (similarity = {score:.4f})")
-        #good_matches = []
-        #for i, (score, distance, fname) in enumerate(matches, start=1):
-            #m_img = Image.open(os.path.join(self.DB_DIR, fname)).convert("RGB")
-            
-        #    good_matches.append(m_img)
+        # 4) KNN in descriptor space (k=2) + ratio test
+        # We want, for each i in img1, the top-2 matches in img2
+        top2_vals, top2_idx = sim.topk(k=2, dim=1)  # each row: best, second-best
 
-        #if len(good_matches) < 10:
-        #    return 0
+        good_matches = []
+        N = Hf * Wf
 
-        #for match_pair in matches:
-        #    if len(match_pair) == 2:
-        #        m, n = match_pair
-        #        if m.distance < 0.75 * n.distance:
-        #            good_matches.append(m)
+        for i in range(N):
+            best_val = top2_vals[i, 0].item()
+            second_val = top2_vals[i, 1].item()
 
-        #if len(good_matches) < 10:
-        #    return 0
+            # Cosine similarity is in [-1,1]. Use ratio test on *distances* or *1 - sim*.
+            # Simpler here: require best significantly better than second-best.
+            # Approximate Lowe ratio in similarity domain:
+            if best_val <= 0:      # reject obviously bad matches
+                continue
 
-        #x_displacements = []
-        #for match in good_matches:
-        #    torch.dist(,p=2)
-        #for match in good_matches:
-        #    pt1_x = kp1[match.queryIdx].pt[0]
-        #    pt2_x = kp2[match.trainIdx].pt[0]
-        #    displacement = pt2_x - pt1_x
-        #    x_displacements.append(displacement)
+            # Convert similarities to "distances" for ratio test:
+            d1 = 1.0 - best_val
+            d2 = 1.0 - second_val
 
-        median_displacement = np.median(matches.dist)
+            if d1 < ratio_thresh * d2:
+                j = top2_idx[i, 0].item()
+                good_matches.append((i, j))
 
-        if median_displacement > 25:
+        if len(good_matches) < min_matches:
+            return 0
+
+        # 5) Convert feature-map indices -> original pixel coordinates
+        # For simplicity, map linearly: x_px ≈ (w + 0.5) * (W_img / Wf)
+        H_img1, W_img1 = current_img.shape[:2]
+        H_img2, W_img2 = target_img.shape[:2]
+
+        stride_x1 = float(W_img1) / float(Wf)
+        stride_x2 = float(W_img2) / float(Wf)
+
+        x_displacements = []
+
+        for i, j in good_matches:
+            h1, w1 = divmod(i, Wf)
+            h2, w2 = divmod(j, Wf)
+
+            # (Optionally) enforce similar vertical row to reduce garbage matches:
+            # if abs(h1 - h2) > 1: continue
+
+            x1 = (w1 + 0.5) * stride_x1
+            x2 = (w2 + 0.5) * stride_x2
+
+            displacement = x2 - x1   # same sign convention as your SIFT code
+            x_displacements.append(displacement)
+
+        if len(x_displacements) == 0:
+            return 0
+
+        median_displacement = float(np.median(x_displacements))
+
+        if median_displacement > pixel_threshold:
             return 1
-        elif median_displacement < -25:
+        elif median_displacement < -pixel_threshold:
             return -1
         else:
             return 0
-        
+    
+    
+    def get_neighbor(self, img, k=1):
+        q_vlad = self.get_vlad(img)
+
+        if not self.lazy_indexing:
+            distances, indices = self.tree.query(q_vlad.reshape(1, -1), k)
+            return indices[0], distances[0]
+        best = []
+        for idx, db_img in enumerate(self.exploration_images):
+            cache_file = os.path.join(self.vlad_cache_dir, f"{idx}.npy")
+            if os.path.exists(cache_file):
+                v = np.load(cache_file)
+            else:
+                v = self.get_vlad(db_img)
+                np.save(cache_file, v)
+
+            d = np.linalg.norm(q_vlad - v)
+            best.append((d, idx))
+        best.sort(key=lambda x: x[0])
+        topk = best[:k]
+        indices = [i for _, i in topk]
+        distances = [d for d, _ in topk]
+        return indices, distances
+    
     def show_navigation_visualization(self, current_img, target_img, action, current_id, target_id):
         current_resized = cv2.resize(current_img, (320, 240))
         target_resized = cv2.resize(target_img, (320, 240))
@@ -308,45 +525,126 @@ class Autonnomous_resnet_Navigator(Player):
         cv2.imshow('Navigation Visualization', visualization)
         cv2.waitKey(1)
 
+    def corridor_sides_free_space(self, img):
+        H, W = img.shape[:2]
+        roi = img[H//2:, :]           # bottom half
+        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+
+        edges = cv2.Canny(roi_gray, 50, 150)    # tune thresholds
+
+        # We'll measure free distance in columns in left and right thirds
+        cols = np.arange(W)
+        left_cols  = cols[:W//3]
+        right_cols = cols[-W//3:]
+
+        def avg_free_dist(cols_subset):
+            dists = []
+            for c in cols_subset:
+                col = edges[:, c]             # bottom-half column, shape [H//2]
+                # We search from bottom up: index 0 is top of ROI, so reverse
+                col_rev = col[::-1]
+                wall_idx = np.argmax(col_rev > 0)   # first edge pixel from bottom
+                if col_rev[wall_idx] == 0:
+                    # No edge in this column → treat as very far
+                    d = len(col_rev)
+                else:
+                    d = wall_idx
+                dists.append(d)
+            if len(dists) == 0:
+                return 0.0
+            return float(np.mean(dists))
+
+        left_free  = avg_free_dist(left_cols)
+        right_free = avg_free_dist(right_cols)
+
+        return left_free, right_free
+    
+    def corridor_center_offset(self, img, eps=1e-3):
+        left_free, right_free = self.corridor_sides_free_space(img)
+        total = left_free + right_free + eps
+        # normalized asymmetry: >0 means closer to left wall (need to steer right)
+        offset = (right_free - left_free) / total
+        return offset, left_free, right_free
+
+    def is_corridor_like(self, left_free, right_free, min_free=10):
+        # min_free is in pixels (in the bottom-half ROI)
+        return (left_free  > min_free) and (right_free > min_free)
+
+    def plan_recovery_sequence(self):
+        # Inspect current FPV to decide how aggressive we need to be
+        offset, left_free, right_free = self.corridor_center_offset(self.fpv)
+
+        # Basic recovery: back up until we see a corridor-like situation
+        # Then center, then forward.
+        self.recovery_queue.clear()
+
+        # Phase 1: back up for a fixed number of steps to get away from the current wall
+        N_BACK = 15
+        self.recovery_queue.extend([Action.BACKWARD] * N_BACK)
+
+        # Phase 2: rotate toward the more open side (offset sign tells you that)
+        # offset > 0 → closer to left wall → turn right
+        if offset > 0:
+            turn_action = Action.RIGHT
+        else:
+            turn_action = Action.LEFT
+
+        N_TURN = 20
+        self.recovery_queue.extend([turn_action] * N_TURN)
+
+        # Phase 3: go forward for a while
+        N_FWD = 1
+        self.recovery_queue.extend([Action.FORWARD] * N_FWD)
+
     def select_action(self):
         if self.fpv is None:
             return Action.IDLE
-        #indices, distances = self.get_neighbor(self.fpv, k=1)
 
-        matched_images = []
-        #for i, target in enumerate(targets):
-        #    indices, distances = self.get_neighbor(target, k=1)
-        #    goal_candidates.append((indices[0], distances[0]))
-        #    matched_images.append(self.exploration_images[indices[0]])
-        #    logging.info(f"Target view {i}: ID {indices[0]} (dist: {distances[0]:.4f})")
-        matches = self.retrieve_matches(self.backbone, self.db_index, self.fpv, top_k=1)
-        #for i, (score, distance, fname) in enumerate(matches, start=1):
-        #    m_img = Image.open(os.path.join(self.DB_DIR, fname)).convert("RGB")
-        #    matched_images.append(m_img)
-        #goal_candidates.append((matches[0], matches[1]))
-        #for rank, (score, fname) in enumerate(matches, start=1):
-        #    print(f"#{rank}: {fname} (similarity = {score:.4f})")
-        #good_matches = []
-        #for i, (score, distance, fname) in enumerate(matches, start=1):
-            #m_img = Image.open(os.path.join(self.DB_DIR, fname)).convert("RGB")
-            
-        #    good_matches.append(m_img)
-        #goal_id = matches[0]
+        if self.recovery_queue:
+            action = self.recovery_queue.popleft()
+            self.action_history.append(action)
+            # no get_neighbor, no compute_turn_direction here
+            return action
+        # --- 1. Cooldown decay so stuck doesn't trigger continuously ---
+        if self.stuck_cooldown > 0:
+            self.stuck_cooldown -= 1
 
-        self.current_id = matches[0]
-        confidence = matches[1]
+        # --- 2. FAST PATH: if we are in a scripted recovery, just execute it ---
+        #     NO neighbor search, NO turn estimation here.
+        if self.recovery_queue:
+            # Optionally refine: if we're in FORWARD phase of recovery,
+            # recompute offset and bias to stay centered.
+            action = self.recovery_queue[0]
+
+            if action == Action.FORWARD:
+                offset, left_free, right_free = self.corridor_center_offset(self.fpv)
+                if offset > 0.15:
+                    action = Action.RIGHT   # adjust to re-center
+                elif offset < -0.15:
+                    action = Action.LEFT
+
+            self.recovery_queue.popleft()
+            return action
+
+        # --- 3. Heavy neighbor search only when NOT in recovery ---
+        indices, distances = self.get_neighbor(self.fpv, k=1)
+        self.current_id = indices[0]
+        confidence = distances[0]
         self.position_history.append(self.current_id)
 
         dist_to_goal = abs(self.goal_id - self.current_id)
         if len(self.position_history) % 25 == 0:
-            dist_to_goal = abs(self.goal_id - self.current_id)
             logging.info(
                 f"Position: {self.current_id}, Goal: {self.goal_id}, "
                 f"Distance: {dist_to_goal}, Confidence: {confidence:.4f}"
             )
+
+        # Goal check: close enough, check in
         if abs(self.current_id - self.goal_id) <= 2:
             logging.info("Goal reached! Checking in...")
             return Action.CHECKIN
+
+        # --- 4. Choose a target frame ahead along the sequence ---
         direction = 1 if self.goal_id > self.current_id else -1
         distance_to_goal = abs(self.goal_id - self.current_id)
         if distance_to_goal > 30:
@@ -358,10 +656,13 @@ class Autonnomous_resnet_Navigator(Player):
 
         target_id = self.current_id + direction * lookahead
         target_id = max(0, min(target_id, self.num_images - 1))
+
         if target_id < len(self.exploration_images):
             target_img = self.exploration_images[target_id]
         else:
+            # Fallback if index is weird
             return Action.FORWARD
+
         if self.recovery_queue:
             action = self.recovery_queue.popleft()
             self.action_history.append(action)
@@ -369,21 +670,21 @@ class Autonnomous_resnet_Navigator(Player):
                 self.show_navigation_visualization(self.fpv, target_img, action,
                                                    self.current_id, target_id)
             return action
-
         if self.is_stuck(dist_to_goal):
-            logging.warning("Stuck detected! Initiating back-off and centering...")
+            logging.warning("Stuck detected! Recovery with corridor centering...")
             self.consecutive_forward = 0
-            self.stuck_cooldown = 5
+            self.stuck_cooldown = 10
             self.position_history.clear()
-            self.recovery_queue.extend([Action.BACKWARD, Action.BACKWARD, Action.BACKWARD])
-            self.recovery_queue.append(Action.FORWARD)
-            self.recovery_queue.extend([Action.RIGHT, Action.FORWARD, Action.LEFT, Action.FORWARD])
+
+            self.plan_recovery_sequence()  # uses corridor_center_offset(self.fpv)
+
             action = self.recovery_queue.popleft()
             self.action_history.append(action)
-            if self.show_visualization:
-                self.show_navigation_visualization(self.fpv, target_img, action,
-                                                   self.current_id, target_id)
             return action
+
+
+
+        # --- 6. Normal steering with visual turn estimation (heavy) ---
         turn = self.compute_turn_direction(self.fpv, target_img)
         if turn == 0:
             action = Action.FORWARD
@@ -394,18 +695,27 @@ class Autonnomous_resnet_Navigator(Player):
         else:
             action = Action.LEFT
             self.consecutive_forward = 0
-        if self.consecutive_forward == 0 and len(self.action_history) >= 3:
-            recent_actions = list(self.action_history)[-3:]
+
+        # Optional safety: avoid endless turning in place
+        if self.consecutive_forward == 0 and len(self.action_history) >= 4:
+            recent_actions = list(self.action_history)[-4:]
             if all(a in [Action.LEFT, Action.RIGHT] for a in recent_actions):
-                logging.info("Too many turns, forcing forward")
-                action = Action.FORWARD
-                self.consecutive_forward = 1
+                logging.info("Too many turns, forcing forward burst")
+                # Force a short burst of forward motion
+                self.recovery_queue.clear()
+                self.recovery_queue.extend([Action.FORWARD] * 4)
+                action = self.recovery_queue.popleft()
+                self.action_history.append(action)
+                return action
+
         self.action_history.append(action)
+
         if self.show_visualization:
             self.show_navigation_visualization(self.fpv, target_img, action,
-                                               self.current_id, target_id)
+                                            self.current_id, target_id)
 
         return action
+
     def act(self):
         if self._state is None:
             return Action.IDLE
@@ -416,6 +726,8 @@ class Autonnomous_resnet_Navigator(Player):
             return Action.IDLE
 
         if phase == Phase.NAVIGATION:
+            if self.nav_start_time is None:
+                self.nav_start_time = time.time()
             if self.goal_id is None:
                 self.goal_id = self.find_goal()
                 if self.goal_id is None:
@@ -429,32 +741,28 @@ class Autonnomous_resnet_Navigator(Player):
         """Receive first-person view"""
         if fpv is not None and len(fpv.shape) == 3:
             self.fpv = fpv.copy()
+            self.fpv_fmap = self._extract_feature_map(self.fpv)
     
     def pre_navigation(self):
-        super(Autonnomous_resnet_Navigator, self).pre_navigation()
-
+        self.codebook_init()
         files = natsorted([x for x in os.listdir(self.save_dir) if x.endswith('.jpg')])
         self.num_images = len(files)
         logging.info("Loading exploration images...")
-        self.exploration_images = []
         for img_file in tqdm(files, desc="Loading images"):
             img = cv2.imread(os.path.join(self.save_dir, img_file))
             self.exploration_images.append(img)
-
         if self.codebook is None:
-
-            if self.yolo_descriptors is None:
-                logging.info("Computing Yolo features for codebook...")
-                self.yolo_descriptors = self.compute_descriptor()
-                np.save("yolo_descriptors.npy", self.yolo_descriptors)
+            if self.resnet_descriptors is None:
+                logging.info("Computing resnet features for codebook...")
+                self.resnet_descriptors = self.compute_features()
+                np.save("self.resnet_descriptors.npy", self.resnet_descriptors)
             logging.info("Building codebook (K-means clustering)...")
             self.codebook = KMeans(
-                n_clusters=128,
+                n_clusters=64,
                 init='k-means++',
                 n_init=5,
                 verbose=0
-            ).fit(self.yolo_descriptors)
-            
+            ).fit(self.resnet_descriptors)
             
             with open("codebook.pkl", "wb") as f:
                 pickle.dump(self.codebook, f)
@@ -533,6 +841,7 @@ def main():
     model = Autonnomous_resnet_Navigator()
     model.backbone = model.build_backbone()
     model.db_index = model.build_db_index(model.backbone)
+    print("model device:", next(model.backbone_spatial.parameters()).device)
     #query_files = sorted(
     #    f for f in os.listdir(QUERY_DIR)
     #    if f.lower().endswith(".jpg")
@@ -549,7 +858,9 @@ def main():
         #vis_path = f"results_{os.path.splitext(qf)[0]}.png"
         #visualize_results(q_path, matches, vis_path)
         #print(f"Saved visualization to {vis_path}")
-
+    print("*" * 30)
+    print("dvl2013 Auto Target Planner")
+    print("*" * 30)
     vis_nav_game.play(the_player=model)
 
 if __name__ == "__main__":
