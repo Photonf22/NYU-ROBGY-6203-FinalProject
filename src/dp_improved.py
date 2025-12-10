@@ -89,7 +89,7 @@ class Autonnomous_resnet_Navigator(Player):
         self.recovery_queue = deque()
         self.in_recovery_mode = False  # NEW: Track if we're executing recovery
         self._state = None
-        self.show_visualization = False
+        self.show_visualization = True
         self.visualization_window = None
         self.target_comparison_window = None
         
