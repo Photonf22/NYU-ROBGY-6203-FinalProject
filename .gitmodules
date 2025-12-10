@@ -1,0 +1,3 @@
+[submodule "vis_nav_player"]
+	path = vis_nav_player
+	url = git@github.com:ai4ce/vis_nav_player.git

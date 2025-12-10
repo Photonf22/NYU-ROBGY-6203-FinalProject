@@ -41,13 +41,13 @@ class Autonnomous_resnet_Navigator(Player):
     def __init__(self, device="cuda"):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        self.save_dir = "data/images_subsample"
+        self.save_dir = "../vis_nav_player/data/images_subsample"
         if not os.path.exists(self.save_dir):
             raise FileNotFoundError(f"Directory {self.save_dir} does not exist")
         if os.path.exists("codebook.pkl"):
             with open("codebook.pkl", "rb") as f:
                 self.codebook = pickle.load(f)
-        self.DATA_ROOT = "./data/"
+        self.DATA_ROOT = "../vis_nav_player/data/"
         # --- Graph / Dijkstra path planning state ---
         # --- Graph / Dijkstra path planning state ---
         self.graph = None           # networkx graph
