@@ -82,9 +82,9 @@ class Autonnomous_resnet_Navigator(Player):
         self.position_history = deque(maxlen=20)
         self.action_history = deque(maxlen=10)  # Increased from 5 to 10
         self.consecutive_forward = 0
-        self.consecutive_turns = 0  # NEW: Track consecutive turns (jittering)
+        self.consecutive_turns = 0  #Track consecutive turns (jittering)
         self.recovery_queue = deque()
-        self.in_recovery_mode = False  # NEW: Track if we're executing recovery
+        self.in_recovery_mode = False  # Track if we're executing recovery
         self._state = None
         self.show_visualization = True
         self.visualization_window = None
@@ -498,7 +498,7 @@ class Autonnomous_resnet_Navigator(Player):
                     logging.error("Failed to find goal")
                     return Action.IDLE
 
-        # NEW: precompute shortest path once
+        # precompute shortest path once
             if self.current_path is None:
                 self.current_path = self.dijkstra_shortest_path(
                     self.current_id, self.goal_id
@@ -717,7 +717,7 @@ class Autonnomous_resnet_Navigator(Player):
         self.position_history.append(self.current_id)
         self.last_positions.append(self.current_id)
 
-        # NEW: Track visits to current position
+        #  Track visits to current position
         visit_count = self.visited_cells.get(self.current_id, 0)
         self.visited_cells[self.current_id] = visit_count + 1
 
