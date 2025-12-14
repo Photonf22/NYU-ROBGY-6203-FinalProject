@@ -48,23 +48,20 @@ class Autonnomous_resnet_Navigator(Player):
             with open("codebook.pkl", "rb") as f:
                 self.codebook = pickle.load(f)
         self.DATA_ROOT = "./data/"
-        # --- Graph / Dijkstra path planning state ---
-        # --- Graph / Dijkstra path planning state ---
         self.graph = None           # networkx graph
         self.current_path = None    # current planned path (list of image ids)
         self.path_valid_for_goal = None  # goal id for which current_path was computed
         self.planned_path = None    # list of node ids (for visualization)
 
-        # Nodes we want the global planner to avoid (dead-ends, traps, etc.)
         self.blocked_nodes = set()
 
-        #QUERY_DIR = os.path.join(DATA_ROOT, "query")
+
         self.DB_DIR = os.path.join(self.DATA_ROOT, "images_subsample")
         self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.backbone = None
         self.fpv_fmap = None
         self.resnet_descriptors = None
-        self.feature_database = None   # NEW: ResNet feature matrix [N, 512] (L2-normalized)
+        self.feature_database = None   # ResNet feature matrix [N, 512] (L2-normalized)
 
         self.turn_action =  Action.RIGHT # default turn action
         self.exploration_images = []
@@ -92,13 +89,12 @@ class Autonnomous_resnet_Navigator(Player):
         self.show_visualization = True
         self.visualization_window = None
         self.target_comparison_window = None
-        
-        # NEW: Enhanced stuck detection
+
         self.last_positions = deque(maxlen=8)  # Track recent positions
         self.oscillation_counter = 0  # Count back-and-forth movements
         self.wall_collision_count = 0  # Count times we hit walls
 
-        # NEW: Visited cell tracking to avoid loops
+
         self.visited_cells = {}  # {image_id: visit_count}
         self.visit_penalty_threshold = 3  # Strongly avoid cells visited 3+ times
         self.recent_visit_window = 50  # Only track visits within last 50 steps
@@ -134,10 +130,7 @@ class Autonnomous_resnet_Navigator(Player):
 
         logging.info("initialized")
     def plan_full_path(self, start_id: int, goal_id: int):
-        """
-        Use Dijkstra to compute the full shortest path from start_id to goal_id.
-        Stores the path in self.planned_path and returns it.
-        """
+
         if self.graph is None:
             raise RuntimeError("Graph is not built. Call build_topology_graph() first.")
 
@@ -150,11 +143,10 @@ class Autonnomous_resnet_Navigator(Player):
 
         logging.info(f"Planned path from {start_id} to {goal_id} with {len(path)} nodes.")
         return path
+    
+
     def save_path_to_file(self, filepath: str = "planned_path.txt"):
-        """
-        Save the current planned path as a simple text file like:
-        0 -> 1 -> 2 -> 5 -> 9 ...
-        """
+
         if not self.planned_path:
             logging.warning("No planned path to save.")
             return
@@ -164,20 +156,19 @@ class Autonnomous_resnet_Navigator(Player):
 
         logging.info(f"Saved planned path to {filepath}")
 
+    # Render the graph to an image, highlighting the planned path.
+    #- Nodes: small dots
+    #- Edges: light lines
+    #- Path edges: thick, dark line
+    #- Start node: green
+    #- Goal node: red
     def save_graph_with_path_image(
         self,
         filename: str = "nav_graph.png",
         start_id: int = None,
         goal_id: int = None
         ):
-        """
-        Render the graph to an image, highlighting the planned path.
-        - Nodes: small dots
-        - Edges: light lines
-        - Path edges: thick, dark line
-        - Start node: green
-        - Goal node: red
-        """
+
         if self.graph is None:
             raise RuntimeError("Graph is not built. Call build_topology_graph() first.")
 
@@ -229,11 +220,11 @@ class Autonnomous_resnet_Navigator(Player):
 
         logging.info(f"Saved graph visualization with path to {filename}")
 
+    
+    # Simple example: chain graph over all image indices.
+    # Replace/extend this if you already have a neighbor structure.
+        
     def build_topology_graph(self):
-        """
-        Simple example: chain graph over all image indices.
-        Replace/extend this if you already have a neighbor structure.
-        """
         G = nx.Graph()
         N = self.num_images
 
@@ -251,13 +242,12 @@ class Autonnomous_resnet_Navigator(Player):
 
     import networkx as nx
 
-    def dijkstra_shortest_path(self, start_id: int, goal_id: int):
-        """
-        Run Dijkstra on self.graph (a networkx.Graph) from start_id to goal_id.
+    # Run Dijkstra on self.graph (a networkx.Graph) from start_id to goal_id.
 
-        Returns a list of node indices [start_id, ..., goal_id] or None if
-        the goal is unreachable.
-        """
+    # Returns a list of node indices [start_id, ..., goal_id] or None if
+    # the goal is unreachable.
+    
+    def dijkstra_shortest_path(self, start_id: int, goal_id: int):
         if self.graph is None:
             self.build_topology_graph()
         if self.graph is None:
@@ -367,8 +357,8 @@ class Autonnomous_resnet_Navigator(Player):
             self.show_target_comparison(targets, matched_images, goal_candidates)
 
         return goal_id
+    # Display target images vs matched database images
     def show_target_comparison(self, targets, matched_images, goal_info):
-        """Display target images vs matched database images"""
         view_names = ['Front', 'Right', 'Back', 'Left']
 
         rows = []
@@ -392,12 +382,10 @@ class Autonnomous_resnet_Navigator(Player):
 
         cv2.imshow('Target Comparison', comparison)
         cv2.waitKey(1)
-    # NEW: Check if path ahead is clear
+    # Check if there's enough clear space ahead to move forward
+    # Returns: (is_clear, forward_distance)
     def is_path_clear(self, img, min_clear_distance=35):  # Balanced (was 50, too sensitive)
-        """
-        Check if there's enough clear space ahead to move forward
-        Returns: (is_clear, forward_distance)
-        """
+
         H, W = img.shape[:2]
         # Focus on center column of bottom half
         roi = img[H//2:, W//3:2*W//3]  # center third, bottom half
@@ -419,11 +407,10 @@ class Autonnomous_resnet_Navigator(Player):
         
         return forward_clear > min_clear_distance, forward_clear
     
-    # IMPROVED: Better stuck detection (MUCH LESS SENSITIVE)
+    # Enhanced stuck detection with multiple criteria
     def is_stuck(self, dist_to_goal):
-        """Enhanced stuck detection with multiple criteria"""
-        # Need MORE history before checking
-        if len(self.position_history) < 15:  # INCREASED from 8
+
+        if len(self.position_history) < 15:  
             return False
 
         recent = list(self.position_history)[-15:]  # Look at more history
@@ -450,19 +437,16 @@ class Autonnomous_resnet_Navigator(Player):
 
         # Return True ONLY if BOTH criteria are met (much less sensitive)
         return position_stuck and progress_stuck
-    def build_db_index(self):
-        """
+
         Build an index of (filename, descriptor) for the gallery DB.
 
-        If self.feature_database is already built (typical when running
-        navigation / pre_navigation), we simply reuse those descriptors,
-        assuming DB_DIR and save_dir point to the same image set and
-        ordering uses natsorted.
+    #If self.feature_database is already built (typical when running
+    #    navigation / pre_navigation), we simply reuse those descriptors,
+    #    assuming DB_DIR and save_dir point to the same image set and
+    #    ordering uses natsorted.
 
-        If self.feature_database is None (e.g., using this class just
-        as a retrieval tool from main() without pre_navigation), we
-        compute descriptors from scratch with compute_descriptor.
-        """
+  
+    def build_db_index(self):
         db_index = []
 
         # IMPORTANT: use natsorted so ordering is consistent with pre_navigation
@@ -554,13 +538,13 @@ class Autonnomous_resnet_Navigator(Player):
         for img_file in tqdm(files, desc="Extracting ResNet descriptors"):
             img = cv2.imread(os.path.join(self.save_dir, img_file))
             self.exploration_images.append(img)
-            des = self.compute_descriptor(self.backbone, img)   # expect (512,) or (1,512)
+            des = self.compute_descriptor(self.backbone, img)   
             if des is not None:
-                des = np.asarray(des).reshape(1, -1)            # (1,512)
-                self.resnet_descriptors.append(des)             # append as row
+                des = np.asarray(des).reshape(1, -1)            
+                self.resnet_descriptors.append(des)            
 
         # stack into [num_images, 512]
-        features = np.vstack(self.resnet_descriptors)           # (N,512)
+        features = np.vstack(self.resnet_descriptors)          
         return features
     def codebook_init(self):
         if os.path.exists("resnet_descriptors.npy"):
@@ -568,18 +552,14 @@ class Autonnomous_resnet_Navigator(Player):
         if os.path.exists("codebook.pkl"):
             with open("codebook.pkl", "rb") as f:
                 self.codebook = pickle.load(f)
+    # Receive first-person view
     def see(self, fpv):
-        """Receive first-person view"""
         if fpv is not None and len(fpv.shape) == 3:
             self.fpv = fpv.copy()
             self.fpv_fmap = self._extract_feature_map(self.fpv)
+
     def pre_navigation(self):
-        """
-        Pre-navigation setup:
-        - Load exploration images from self.save_dir
-        - Build (or load) a ResNet feature database
-        - NO KMeans, NO VLAD, NO BallTree
-        """
+
         files = natsorted([x for x in os.listdir(self.save_dir)
                            if x.endswith('.jpg')])
         self.num_images = len(files)
@@ -616,16 +596,14 @@ class Autonnomous_resnet_Navigator(Player):
 
         logging.info(f"Feature database ready: {self.feature_database.shape[0]} images")
 
-        # If you already added Dijkstra earlier, you can still do:
-        # self.build_topology_graph()
+
+    
+    #SIMPLE stuck recovery:
+    #    1. Back up 20 steps
+    #    2. Turn 180 degrees
+    #    3. Go forward 10 steps
 
     def plan_recovery_sequence(self):
-        """
-        SIMPLE stuck recovery:
-        1. Back up 20 steps
-        2. Turn 180 degrees
-        3. Go forward 10 steps
-        """
         self.recovery_queue.clear()
         self.in_recovery_mode = True
 
@@ -683,18 +661,8 @@ class Autonnomous_resnet_Navigator(Player):
         cv2.imshow('Navigation Visualization', visualization)
         cv2.waitKey(1)
 
-    # All other methods from original file go here...
-    # (I'm including the key select_action method with improvements)
     def get_neighbor(self, img, k=1):
-        """
-        Nearest neighbor search using direct ResNet descriptors
-        and cosine similarity (no VLAD, no KMeans, no BallTree).
 
-        Returns:
-            indices:  list of length k with image indices
-            distances: list of length k with "distances" = 1 - cosine_similarity
-                       (so smaller is better, consistent with old code).
-        """
         # Make sure feature database exists
         if self.feature_database is None:
             raise RuntimeError(
@@ -725,9 +693,8 @@ class Autonnomous_resnet_Navigator(Player):
         distances_list = top_dists.tolist()
         return indices, distances_list
 
-    
+    # Enhanced action selection with wall awareness
     def select_action(self):
-        """Enhanced action selection with wall awareness"""
         if self.fpv is None:
             return Action.IDLE
 
@@ -789,9 +756,6 @@ class Autonnomous_resnet_Navigator(Player):
                 return Action.CHECKIN
 
 
-        # Determine target frame
-        # Determine target frame using Dijkstra path planning
-        # (graph over exploration images, edges between neighbors)
         target_id = self.get_next_target_id_from_dijkstra(self.current_id, self.goal_id)
 
         # Clamp just in case
@@ -803,9 +767,6 @@ class Autonnomous_resnet_Navigator(Player):
             # Fallback: safest default
             return Action.FORWARD
 
-
-        # NEW: Check for stuck BEFORE trying to move
-        # NEW: Check for stuck BEFORE trying to move
         if self.stuck_cooldown == 0 and self.is_stuck(dist_to_goal):
             logging.warning("Stuck detected! Initiating recovery...")
             self.consecutive_forward = 0
@@ -819,15 +780,14 @@ class Autonnomous_resnet_Navigator(Player):
                 self.action_history.append(action)
                 return action
 
-        # NEW: Simple dead-end detection - if hitting wall, just turn around
+        # Simple dead-end detection - if hitting wall, just turn around
         is_clear, forward_dist = self.is_path_clear(self.fpv)
         offset, left_free, right_free = self.corridor_center_offset(self.fpv)
 
         # Dead-end: both sides close AND forward blocked
         is_dead_end = (left_free < 70 and right_free < 70 and forward_dist < 40)
         if is_dead_end:
-            # We hit a clear dead-end: mark this node as blocked for the
-            # global planner so future Dijkstra runs will try to avoid it.
+
             logging.warning(
                 f"DEAD END detected! L={left_free:.0f}, "
                 f"R={right_free:.0f}, F={forward_dist:.0f}"
@@ -835,8 +795,7 @@ class Autonnomous_resnet_Navigator(Player):
 
             if self.current_id is not None and self.current_id != self.goal_id:
                 self.blocked_nodes.add(self.current_id)
-                # Invalidate any previously computed global path, since it may
-                # have routed us straight into this dead-end.
+
                 self.current_path = None
                 self.path_valid_for_goal = None
                 self.planned_path = None
@@ -850,15 +809,12 @@ class Autonnomous_resnet_Navigator(Player):
             self.consecutive_forward = 0
             self.consecutive_turns = 0
             return action
+        # Close to wall on one side - just steer away gently
 
-        # Close to a wall but not a full dead-end: do a mini recovery
-        # This handles the "staring at a wall" situation.
-    # Close to wall on one side - just steer away gently
-      # Close to wall on one side - just steer away gently
         if forward_dist < 20 and self.consecutive_forward > 3:
             logging.info(f"Close to wall (dist={forward_dist}), small recovery turn")
             self.recovery_queue.clear()
-            # tiny back-up, then turn toward free side
+
             self.recovery_queue.extend([Action.BACKWARD] * 3)
             turn_action = Action.RIGHT if right_free > left_free else Action.LEFT
             self.recovery_queue.extend([turn_action] * 6)
@@ -866,7 +822,7 @@ class Autonnomous_resnet_Navigator(Player):
             self.consecutive_forward = 0
             return action
 
-        # NEW: Limit excessive forward movement (INCREASED LIMIT)
+        # Limit excessive forward movement (INCREASED LIMIT)
         MAX_CONSECUTIVE_FORWARD = 40  # DOUBLED from 20
         if self.consecutive_forward >= MAX_CONSECUTIVE_FORWARD:
             logging.info(f"Max forward limit ({MAX_CONSECUTIVE_FORWARD}) reached, reassessing")
@@ -882,7 +838,7 @@ class Autonnomous_resnet_Navigator(Player):
         # Normal steering with visual turn estimation
         turn = self.compute_turn_direction(self.fpv, target_img)
 
-        # NEW: Apply corridor centering bias
+        # Apply corridor centering bias
         offset, left_free, right_free = self.corridor_center_offset(self.fpv)
 
         # If we're significantly off-center, bias the turn decision
@@ -892,7 +848,7 @@ class Autonnomous_resnet_Navigator(Player):
             elif offset < -0.2 and turn != 1:  # Too close to right, bias left
                 turn = -1
 
-        # NEW: Visit-aware navigation - avoid heavily visited areas
+        # Visit-aware navigation - avoid heavily visited areas
         if visit_count >= self.visit_penalty_threshold:
             logging.info(f"Heavily visited cell (visits={visit_count}), biasing toward exploration)")
 
@@ -909,8 +865,7 @@ class Autonnomous_resnet_Navigator(Player):
                 turn = 1 if (visit_count % 2 == 0) else -1
                 logging.info("Using pseudo-random turn to escape visited cell")
 
-            # We do NOT use a forward_id or direction anymore—Dijkstra handles global planning.
-                # EXTREME over-visit: declare this node bad for global planning
+        # EXTREME over-visit: declare this node bad for global planning
         severe_overvisit_threshold = max(self.visit_penalty_threshold * 3, 50)
 
         if visit_count >= severe_overvisit_threshold:
@@ -922,14 +877,12 @@ class Autonnomous_resnet_Navigator(Player):
                     )
                     self.blocked_nodes.add(self.current_id)
 
-                    # Invalidate current global path; next call to
-                    # get_next_target_id_from_dijkstra will recompute.
                     self.current_path = None
                     self.path_valid_for_goal = None
                     self.planned_path = None
 
 
-        # NEW: When no progress for a while, prefer FORWARD to break jittering
+        # When no progress for a while, prefer FORWARD to break jittering
         if self.no_progress_steps > 10 and turn != 0:
             # Force forward occasionally to break oscillation
             if self.no_progress_steps % 5 == 0:
@@ -949,23 +902,13 @@ class Autonnomous_resnet_Navigator(Player):
             self.consecutive_forward = 0
             self.consecutive_turns += 1
 
-        # NEW: Detect jittering (many consecutive turns without forward)
+        # Detect jittering (many consecutive turns without forward)
         if self.consecutive_turns >= 8:
             logging.warning(f"Jittering detected ({self.consecutive_turns} turns), forcing forward burst")
             self.recovery_queue.clear()
             self.recovery_queue.extend([Action.FORWARD] * 10)
             self.consecutive_turns = 0
             action = self.recovery_queue.popleft()
-
-        # Safety: avoid endless turning (DISABLED - causes oscillation with recovery)
-        # Instead rely on stuck detection and forward limit
-        # if self.consecutive_forward == 0 and len(self.action_history) >= 6:
-        #     recent_actions = list(self.action_history)[-6:]
-        #     if sum(1 for a in recent_actions if a in [Action.LEFT, Action.RIGHT]) >= 5:
-        #         logging.info("Too many turns, forcing forward burst")
-        #         self.recovery_queue.clear()
-        #         self.recovery_queue.extend([Action.FORWARD] * 3)
-        #         action = self.recovery_queue.popleft()
 
         self.action_history.append(action)
 
@@ -1020,16 +963,8 @@ class Autonnomous_resnet_Navigator(Player):
                                ratio_thresh=0.75,
                                min_matches=10,
                                pixel_threshold=10.0):
-        """
-        current_img, target_img: OpenCV BGR uint8 images.
-        Returns:
-            1  = turn one way (e.g. "right")
-           -1  = turn the other way (e.g. "left")
-            0  = no clear turn
-        """
-        #if fmap1 is None:
-        #    fmap1 = self._extract_feature_map(current_img)
-        # 1) Feature maps
+
+
         fmap1 = self._extract_feature_map(current_img)  # [C, Hf, Wf]
         fmap2 = self._extract_feature_map(target_img)   # [C, Hf, Wf]
 
@@ -1090,9 +1025,6 @@ class Autonnomous_resnet_Navigator(Player):
             h1, w1 = divmod(i, Wf)
             h2, w2 = divmod(j, Wf)
 
-            # (Optionally) enforce similar vertical row to reduce garbage matches:
-            # if abs(h1 - h2) > 1: continue
-
             x1 = (w1 + 0.5) * stride_x1
             x2 = (w2 + 0.5) * stride_x2
 
@@ -1110,7 +1042,7 @@ class Autonnomous_resnet_Navigator(Player):
             return -1
         else:
             return 0
-    # Placeholder - copy your existing methods here
+
     def prepare_for_resnet(self, img_bgr):
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(img_rgb)
@@ -1155,9 +1087,6 @@ class Autonnomous_resnet_Navigator(Player):
         return left_free, right_free
     
     def retrieve_matches(self, backbone, db_index, img, top_k=10):
-        #for i, fname in enumerate(img_path):
-        #    path = os.path.join(self.DB_DIR, fname)
-        #print(type(img))
 
         q_desc = self.compute_descriptor(backbone, img)
      
@@ -1170,7 +1099,7 @@ class Autonnomous_resnet_Navigator(Player):
         sims.sort(reverse=True, key=lambda x: x[0]) 
         return sims[:top_k]
     def is_corridor_like(self, left_free, right_free, min_free=10):
-        # min_free is in pixels (in the bottom-half ROI)
+
         return (left_free  > min_free) and (right_free > min_free)
     
     def corridor_center_offset(self, img, eps=1e-3):
@@ -1179,10 +1108,8 @@ class Autonnomous_resnet_Navigator(Player):
         offset = (right_free - left_free) / total
         return offset, left_free, right_free
 
-    # Include all other methods from your original file...
-    # (For brevity, I've shown the key improvements. Copy remaining methods from dp.py)
+
     def prepare_for_resnet(self,img_bgr):
-        # img_bgr: numpy [240,320,3] uint8 from cv2
 
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(img_rgb)
@@ -1207,17 +1134,12 @@ class Autonnomous_resnet_Navigator(Player):
         fig.savefig(out_path, dpi=200)
         plt.close(fig)
 
-# using resnet backbone to do image retrieval and compare query images with database images
-# then using cosine similarity to find individuals
 def main():
     import vis_nav_game
     model = Autonnomous_resnet_Navigator()
     model.backbone = model.build_backbone()
     model.pre_navigation()
-    # If you want to reuse pre_navigation’s features for retrieval,
-    # you can optionally call:
-    # model.pre_navigation()
-    # Then build_db_index() will reuse model.feature_database.
+
     start_id = 0
     model.db_index = model.build_db_index()
     goal_id = model.num_images - 1
