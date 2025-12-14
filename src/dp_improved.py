@@ -438,14 +438,6 @@ class Autonnomous_resnet_Navigator(Player):
         # Return True ONLY if BOTH criteria are met (much less sensitive)
         return position_stuck and progress_stuck
 
-        Build an index of (filename, descriptor) for the gallery DB.
-
-    #If self.feature_database is already built (typical when running
-    #    navigation / pre_navigation), we simply reuse those descriptors,
-    #    assuming DB_DIR and save_dir point to the same image set and
-    #    ordering uses natsorted.
-
-  
     def build_db_index(self):
         db_index = []
 
